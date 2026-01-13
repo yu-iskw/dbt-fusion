@@ -54,7 +54,7 @@ impl<'a> SelectorParser<'a> {
 
     pub fn parse_composite(&self, comp: &CompositeExpr) -> FsResult<SelectExpression> {
         let mut includes = Vec::new();
-        let mut exclude_expr: Option<SelectExpression> = None;
+        let mut exclude_exprs = Vec::new();
 
         // Get the operator and values from the single entry map
         let (op_kind, values) = comp
@@ -82,7 +82,7 @@ impl<'a> SelectorParser<'a> {
                     1 => exprs.into_iter().next().unwrap(),
                     _ => SelectExpression::Or(exprs),
                 };
-                exclude_expr = Some(exclude_expression);
+                exclude_exprs.push(exclude_expression);
             } else {
                 // Handle regular include expressions
                 let resolved = self.parse_definition(value)?;
@@ -96,16 +96,19 @@ impl<'a> SelectorParser<'a> {
             CompositeKind::Intersection(_) => SelectExpression::And(includes),
         };
 
-        // If we have an exclude expression, we need to handle this specially
-        // For now, let's create a structure that represents "include this but exclude that"
-        // We'll use a custom approach that the scheduler can handle
-        if let Some(exclude) = exclude_expr {
-            // Create a structure that represents the composite with exclude
-            // We'll use a special marker that the scheduler can recognize
-            // For now, let's just return the include expression and handle the exclude in the scheduler
+        // If we have exclude expressions, combine them
+        if !exclude_exprs.is_empty() {
+            // If there are multiple excludes, we treat them as a union of exclusions
+            // i.e., exclude (A or B or C)
+            let combined_exclude = if exclude_exprs.len() == 1 {
+                exclude_exprs.into_iter().next().unwrap()
+            } else {
+                SelectExpression::Or(exclude_exprs)
+            };
+
             return Ok(SelectExpression::And(vec![
                 include_expr,
-                SelectExpression::Exclude(Box::new(exclude)),
+                SelectExpression::Exclude(Box::new(combined_exclude)),
             ]));
         }
 
@@ -857,6 +860,322 @@ mod tests {
         } else {
             panic!("Expected And expression");
         }
+        Ok(())
+    }
+
+    // Helper to create a string selector
+    fn s(val: &str) -> SelectorDefinitionValue {
+        SelectorDefinitionValue::String(val.to_string())
+    }
+
+    // Helper to create an exclude block
+    fn exclude(vals: Vec<&str>) -> SelectorDefinitionValue {
+        let exclude_vals = vals.into_iter().map(s).collect();
+        SelectorDefinitionValue::Full(SelectorExpr::Atom(AtomExpr::Exclude(ExcludeAtomExpr {
+            exclude: exclude_vals,
+        })))
+    }
+
+    // Helper to create a composite selector
+    fn composite(kind: &str, items: Vec<SelectorDefinitionValue>) -> SelectorDefinitionValue {
+        let mut m = BTreeMap::new();
+        let k = match kind {
+            "union" => CompositeKind::Union(items),
+            "intersection" => CompositeKind::Intersection(items),
+            _ => panic!("Unknown kind"),
+        };
+        m.insert(kind.to_string(), k);
+        SelectorDefinitionValue::Full(SelectorExpr::Composite(CompositeExpr { kind: m }))
+    }
+
+    #[test]
+    fn test_basic_union_with_exclude() -> FsResult<()> {
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        // union: [A, exclude: [B]]
+        // Logic: (A) AND NOT (B)
+
+        let def = composite("union", vec![s("tag:A"), exclude(vec!["tag:B"])]);
+        let result = parser.parse_definition(&def)?;
+
+        if let SelectExpression::And(exprs) = result {
+            // [Or([A]), Exclude(B)]
+            assert_eq!(exprs.len(), 2);
+            if let SelectExpression::Or(inc) = &exprs[0] {
+                assert_eq!(inc.len(), 1);
+                if let SelectExpression::Atom(c) = &inc[0] { assert_eq!(c.value, "A"); }
+            }
+            if let SelectExpression::Exclude(exc) = &exprs[1] {
+                if let SelectExpression::Atom(c) = &**exc { assert_eq!(c.value, "B"); }
+            }
+        } else {
+            panic!("Expected And(Or([A]), Exclude(B)), got {:?}", result);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_basic_intersection_with_exclude() -> FsResult<()> {
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        // intersection: [A, exclude: [B]]
+        // Logic: (A) AND NOT (B)
+
+        let def = composite("intersection", vec![s("tag:A"), exclude(vec!["tag:B"])]);
+        let result = parser.parse_definition(&def)?;
+
+        if let SelectExpression::And(exprs) = result {
+            // [And([A]), Exclude(B)]
+            assert_eq!(exprs.len(), 2);
+            if let SelectExpression::And(inc) = &exprs[0] {
+                if let SelectExpression::Atom(c) = &inc[0] { assert_eq!(c.value, "A"); }
+            }
+            if let SelectExpression::Exclude(exc) = &exprs[1] {
+                if let SelectExpression::Atom(c) = &**exc { assert_eq!(c.value, "B"); }
+            }
+        } else {
+            panic!("Expected And(And([A]), Exclude(B)), got {:?}", result);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_excludes_union() -> FsResult<()> {
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        // union: [A, exclude: [B], exclude: [C]]
+        // Logic: (A) AND NOT (B OR C)
+
+        let def = composite("union", vec![
+            s("tag:A"),
+            exclude(vec!["tag:B"]),
+            exclude(vec!["tag:C"])
+        ]);
+        let result = parser.parse_definition(&def)?;
+
+        if let SelectExpression::And(exprs) = result {
+            // [Or([A]), Exclude(Or([B, C]))]
+            let ex = &exprs[1];
+            if let SelectExpression::Exclude(inner) = ex {
+                if let SelectExpression::Or(list) = &**inner {
+                    let vals: Vec<String> = list.iter().map(|e| if let SelectExpression::Atom(c) = e { c.value.clone() } else { "".to_string() }).collect();
+                    assert!(vals.contains(&"B".to_string()));
+                    assert!(vals.contains(&"C".to_string()));
+                } else { panic!("Expected Or inside Exclude"); }
+            } else { panic!("Expected Exclude"); }
+        } else { panic!("Expected And"); }
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_excludes_intersection() -> FsResult<()> {
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        // intersection: [A, exclude: [B], exclude: [C]]
+        // Logic: (A) AND NOT (B OR C)
+
+        let def = composite("intersection", vec![
+            s("tag:A"),
+            exclude(vec!["tag:B"]),
+            exclude(vec!["tag:C"])
+        ]);
+        let result = parser.parse_definition(&def)?;
+
+        if let SelectExpression::And(exprs) = &result {
+            // [And([A]), Exclude(Or([B, C]))]
+            let ex = &exprs[1];
+            if let SelectExpression::Exclude(inner) = ex {
+                if let SelectExpression::Or(list) = &**inner {
+                    let vals: Vec<String> = list.iter().map(|e| if let SelectExpression::Atom(c) = e { c.value.clone() } else { "".to_string() }).collect();
+                    assert!(vals.contains(&"B".to_string()));
+                    assert!(vals.contains(&"C".to_string()));
+                } else { panic!("Expected Or inside Exclude, got {:?}", inner); }
+            } else { panic!("Expected Exclude, got {:?}", ex); }
+        } else {
+             panic!("Expected And expression, got {:?}", result);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_of_intersections_with_exclude() -> FsResult<()> {
+        // Mimics the user case structure but generic
+        // union:
+        //   - intersection: [A, union: [B, C, exclude: [D]]]
+        //   - intersection: [E, F]
+
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        let inner_union = composite("union", vec![
+            s("tag:B"),
+            s("tag:C"),
+            exclude(vec!["tag:D"])
+        ]);
+
+        let intersection1 = composite("intersection", vec![
+            s("tag:A"),
+            inner_union
+        ]);
+
+        let intersection2 = composite("intersection", vec![
+            s("tag:E"),
+            s("tag:F")
+        ]);
+
+        let top = composite("union", vec![intersection1, intersection2]);
+
+        let result = parser.parse_definition(&top)?;
+
+        // Structure:
+        // Or([
+        //   And([ A, And([ Or([B, C]), Exclude(D) ]) ]),  <-- Intersection 1
+        //   And([ E, F ])                                 <-- Intersection 2
+        // ])
+
+        if let SelectExpression::Or(top_list) = &result {
+            assert_eq!(top_list.len(), 2);
+
+            // Check Intersection 1
+            if let SelectExpression::And(i1) = &top_list[0] {
+                // A, InnerUnion
+                if let SelectExpression::Atom(a) = &i1[0] { assert_eq!(a.value, "A"); }
+                else { panic!("Expected Atom A, got {:?}", i1[0]); }
+
+                if let SelectExpression::And(u) = &i1[1] {
+                    // Or([B,C]), Exclude(D)
+                    if let SelectExpression::Or(bc) = &u[0] { assert_eq!(bc.len(), 2); }
+                    else { panic!("Expected Or([B,C]), got {:?}", u[0]); }
+
+                    if let SelectExpression::Exclude(d) = &u[1] {
+                        if let SelectExpression::Atom(da) = &**d { assert_eq!(da.value, "D"); }
+                        else { panic!("Expected Atom D inside exclude, got {:?}", d); }
+                    }
+                    else { panic!("Expected Exclude(D), got {:?}", u[1]); }
+                }
+                else { panic!("Expected InnerUnion And, got {:?}", i1[1]); }
+            }
+            else { panic!("Expected Intersection 1 And, got {:?}", top_list[0]); }
+
+            // Check Intersection 2
+            if let SelectExpression::And(i2) = &top_list[1] {
+                assert_eq!(i2.len(), 2);
+            }
+            else { panic!("Expected Intersection 2 And, got {:?}", top_list[1]); }
+        } else {
+            panic!("Expected Or top level, got {:?}", result);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_intersection_of_unions_with_exclude() -> FsResult<()> {
+        // intersection:
+        //   - union: [A, exclude: [B]]
+        //   - union: [C, exclude: [D]]
+
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        let u1 = composite("union", vec![s("tag:A"), exclude(vec!["tag:B"])]);
+        let u2 = composite("union", vec![s("tag:C"), exclude(vec!["tag:D"])]);
+
+        let top = composite("intersection", vec![u1, u2]);
+
+        let result = parser.parse_definition(&top)?;
+
+        // And([
+        //   And([ Or([A]), Exclude(B) ]),
+        //   And([ Or([C]), Exclude(D) ])
+        // ])
+
+        if let SelectExpression::And(top_list) = &result {
+            assert_eq!(top_list.len(), 2);
+            // Verify structure roughly
+            if let SelectExpression::And(u1_res) = &top_list[0] {
+                if let SelectExpression::Exclude(ex) = &u1_res[1] {
+                    if let SelectExpression::Atom(c) = &**ex { assert_eq!(c.value, "B"); }
+                    else { panic!("Expected Atom B, got {:?}", ex); }
+                }
+                else { panic!("Expected Exclude B, got {:?}", u1_res[1]); }
+            }
+            else { panic!("Expected And u1_res, got {:?}", top_list[0]); }
+
+            if let SelectExpression::And(u2_res) = &top_list[1] {
+                if let SelectExpression::Exclude(ex) = &u2_res[1] {
+                    if let SelectExpression::Atom(c) = &**ex { assert_eq!(c.value, "D"); }
+                    else { panic!("Expected Atom D, got {:?}", ex); }
+                }
+                else { panic!("Expected Exclude D, got {:?}", u2_res[1]); }
+            }
+            else { panic!("Expected And u2_res, got {:?}", top_list[1]); }
+        } else {
+            panic!("Expected And top level, got {:?}", result);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_deeply_nested_excludes() -> FsResult<()> {
+        // union:
+        //   - exclude:
+        //       - union:
+        //           - A
+        //           - exclude: [B]
+
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        let inner = composite("union", vec![s("tag:A"), exclude(vec!["tag:B"])]);
+        // The exclude atom contains a list of definitions. `inner` is a definition (Full).
+
+        let exclude_inner = SelectorDefinitionValue::Full(SelectorExpr::Atom(AtomExpr::Exclude(ExcludeAtomExpr {
+            exclude: vec![inner],
+        })));
+
+        let top = composite("union", vec![exclude_inner]); // Just an exclude at top level wrapped in union
+
+        let result = parser.parse_definition(&top)?;
+
+        // Result: Or([ Exclude(...) ])
+        // Note: The parser for `parse_composite` (union) collects includes (empty) and excludes (one).
+        // It then returns And( [ Or(includes), Exclude(...) ] ).
+        // Since includes is empty, it returns And( [ Or([]), Exclude(...) ] ).
+        // So we expect And at the top level, not Or.
+
+        if let SelectExpression::And(list) = &result {
+             // list[0] is Or([]) (includes)
+             // list[1] is Exclude(...)
+             if let SelectExpression::Exclude(inner_res) = &list[1] {
+                 // The inner content is the parsed result of `inner`
+                 // `inner` is Union([A, Exclude(B)]) -> And([ Or([A]), Exclude(B) ])
+                 if let SelectExpression::And(parts) = &**inner_res {
+                     assert_eq!(parts.len(), 2);
+                     if let SelectExpression::Exclude(b) = &parts[1] {
+                         if let SelectExpression::Atom(c) = &**b { assert_eq!(c.value, "B"); }
+                         else { panic!("Expected Atom B, got {:?}", b); }
+                     }
+                     else { panic!("Expected Exclude B, got {:?}", parts[1]); }
+                 } else { panic!("Expected And inside Exclude, got {:?}", inner_res); }
+             } else { panic!("Expected Exclude at index 1, got {:?}", list[1]); }
+        } else {
+             // If it returns Or, check what it is (but expected is And based on logic)
+             panic!("Expected And top level (union of only exclude -> And(Or([]), Exclude)), got {:?}", result);
+        }
+
         Ok(())
     }
 }
