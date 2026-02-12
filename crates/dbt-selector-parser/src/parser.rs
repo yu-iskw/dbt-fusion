@@ -859,4 +859,186 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn test_intersection_with_non_matching_exclude() -> FsResult<()> {
+        // Test for issue #1279: when an exclude pattern matches no models,
+        // the intersection should return the models matching the other criteria
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        let expr = SelectorExpr::Composite(CompositeExpr {
+            kind: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "intersection".to_string(),
+                    CompositeKind::Intersection(vec![
+                        SelectorDefinitionValue::String("path:models/test_exclude/bronze/bronze_*".to_string()),
+                        SelectorDefinitionValue::Full(SelectorExpr::Atom(AtomExpr::Exclude(ExcludeAtomExpr {
+                            exclude: vec![SelectorDefinitionValue::String("path:models/test_exclude/bronse/no_such_model_*".to_string())]
+                        }))),
+                    ]),
+                );
+                m
+            },
+        });
+
+        let result = parser.parse_expr(&expr)?;
+
+        // The result should be And([path_criteria, Exclude(path_criteria_for_non_matching)])
+        if let SelectExpression::And(exprs) = result {
+            assert_eq!(exprs.len(), 2);
+
+            // First expression should be the path selector
+            if let SelectExpression::Atom(criteria) = &exprs[0] {
+                assert_eq!(criteria.method, MethodName::Path);
+                assert_eq!(criteria.value, "models/test_exclude/bronze/bronze_*");
+            } else {
+                panic!("Expected first expression to be Atom");
+            }
+
+            // Second expression should be Exclude
+            if let SelectExpression::Exclude(inner) = &exprs[1] {
+                if let SelectExpression::Atom(exclude_criteria) = &**inner {
+                    assert_eq!(exclude_criteria.method, MethodName::Path);
+                    assert_eq!(exclude_criteria.value, "models/test_exclude/bronse/no_such_model_*");
+                } else {
+                    panic!("Expected Exclude to contain an Atom");
+                }
+            } else {
+                panic!("Expected second expression to be Exclude");
+            }
+        } else {
+            panic!("Expected And expression");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_excludes_in_intersection() -> FsResult<()> {
+        // Test that multiple exclude blocks in an intersection are handled correctly
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        let expr = SelectorExpr::Composite(CompositeExpr {
+            kind: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "intersection".to_string(),
+                    CompositeKind::Intersection(vec![
+                        SelectorDefinitionValue::String("tag:production".to_string()),
+                        SelectorDefinitionValue::Full(SelectorExpr::Atom(AtomExpr::Exclude(ExcludeAtomExpr {
+                            exclude: vec![SelectorDefinitionValue::String("tag:deprecated".to_string())]
+                        }))),
+                        SelectorDefinitionValue::Full(SelectorExpr::Atom(AtomExpr::Exclude(ExcludeAtomExpr {
+                            exclude: vec![SelectorDefinitionValue::String("tag:test".to_string())]
+                        }))),
+                    ]),
+                );
+                m
+            },
+        });
+
+        let result = parser.parse_expr(&expr)?;
+
+        // Should create And([tag:production, Exclude(Or([tag:deprecated, tag:test]))])
+        if let SelectExpression::And(exprs) = result {
+            assert_eq!(exprs.len(), 2);
+
+            // First should be the tag selector
+            if let SelectExpression::Atom(criteria) = &exprs[0] {
+                assert_eq!(criteria.method, MethodName::Tag);
+                assert_eq!(criteria.value, "production");
+            } else {
+                panic!("Expected first expression to be Atom");
+            }
+
+            // Second should be Exclude(Or([tag:deprecated, tag:test]))
+            if let SelectExpression::Exclude(inner) = &exprs[1] {
+                if let SelectExpression::Or(or_exprs) = &**inner {
+                    assert_eq!(or_exprs.len(), 2);
+
+                    if let SelectExpression::Atom(criteria1) = &or_exprs[0] {
+                        assert_eq!(criteria1.method, MethodName::Tag);
+                        assert_eq!(criteria1.value, "deprecated");
+                    } else {
+                        panic!("Expected first Or item to be Atom");
+                    }
+
+                    if let SelectExpression::Atom(criteria2) = &or_exprs[1] {
+                        assert_eq!(criteria2.method, MethodName::Tag);
+                        assert_eq!(criteria2.value, "test");
+                    } else {
+                        panic!("Expected second Or item to be Atom");
+                    }
+                } else {
+                    panic!("Expected Exclude to contain Or expression");
+                }
+            } else {
+                panic!("Expected second expression to be Exclude");
+            }
+        } else {
+            panic!("Expected And expression");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_with_exclude() -> FsResult<()> {
+        // Test union with exclude pattern
+        let defs = BTreeMap::new();
+        let io_args = IoArgs::default();
+        let parser = SelectorParser::new(defs, &io_args);
+
+        let expr = SelectorExpr::Composite(CompositeExpr {
+            kind: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "union".to_string(),
+                    CompositeKind::Union(vec![
+                        SelectorDefinitionValue::String("tag:daily".to_string()),
+                        SelectorDefinitionValue::String("tag:weekly".to_string()),
+                        SelectorDefinitionValue::Full(SelectorExpr::Atom(AtomExpr::Exclude(ExcludeAtomExpr {
+                            exclude: vec![SelectorDefinitionValue::String("tag:skip".to_string())]
+                        }))),
+                    ]),
+                );
+                m
+            },
+        });
+
+        let result = parser.parse_expr(&expr)?;
+
+        // Should create And([Or([tag:daily, tag:weekly]), Exclude(tag:skip)])
+        if let SelectExpression::And(exprs) = result {
+            assert_eq!(exprs.len(), 2);
+
+            // First should be Or
+            if let SelectExpression::Or(or_exprs) = &exprs[0] {
+                assert_eq!(or_exprs.len(), 2);
+            } else {
+                panic!("Expected first expression to be Or");
+            }
+
+            // Second should be Exclude
+            if let SelectExpression::Exclude(inner) = &exprs[1] {
+                if let SelectExpression::Atom(criteria) = &**inner {
+                    assert_eq!(criteria.method, MethodName::Tag);
+                    assert_eq!(criteria.value, "skip");
+                } else {
+                    panic!("Expected Exclude to contain Atom");
+                }
+            } else {
+                panic!("Expected second expression to be Exclude");
+            }
+        } else {
+            panic!("Expected And expression");
+        }
+
+        Ok(())
+    }
 }
